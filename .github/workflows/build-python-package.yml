@@ -1,0 +1,604 @@
+name: 'Build and Package ITK Remote Module'
+
+on:
+  # Manual self-test: build a real remote module's wheels with this workflow
+  # without needing a downstream caller repository. Only the macOS job runs.
+  workflow_dispatch:
+    inputs:
+      test-module-repository:
+        description: 'Remote module repository to build for testing this workflow'
+        required: false
+        type: string
+        default: 'InsightSoftwareConsortium/ITKSplitComponents'
+      itk-wheel-tag:
+        description: 'Github release version tag for the ITKPythonBuilds build archive to use'
+        required: false
+        type: string
+        default: 'v6.0b02'
+      python3-minor-versions:
+        description: 'JSON-formatted array of Python 3.x minor version wheel targets'
+        required: false
+        type: string
+        default: '["11"]'
+      macosx-deployment-target:
+        description: 'MACOSX_DEPLOYMENT_TARGET, e.g. "15.0"'
+        required: false
+        type: string
+        default: '15.0'
+  workflow_call:
+    inputs:
+      cmake-options:
+        description: 'CMake configuration parameters for the module under test'
+        required: false
+        type: string
+        default: ""
+      itk-wheel-tag:
+        # See https://github.com/InsightSoftwareConsortium/ITKPythonBuilds/releases
+        description: 'Github release version tag for the ITKPythonBuilds build archive to use'
+        required: false
+        type: string
+        default: 'v6.0b02'
+      itk-python-package-tag:
+        # See https://github.com/InsightSoftwareConsortium/ITKPythonPackage
+        description: 'Git tag or commit hash for ITKPythonPackage build scripts to use'
+        required: false
+        type: string
+        # v6.0b02
+        default: 'v6.0b02'
+      itk-python-package-org:
+        description: 'Github organization name for fetching ITKPythonPackage build scripts'
+        required: false
+        type: string
+        default: 'InsightSoftwareConsortium'
+      itk-module-deps:
+        description: 'Colon-delimited list of ITK remote module dependencies to build. Format as org/module_name@tag:...'
+        # example: InsightSoftwareConsortium/ITKMeshToPolyData@3ad8f08:InsightSoftwareConsortium/ITKBSplineGradient@0.3.0
+        required: false
+        type: string
+      python3-minor-versions:
+        description: 'JSON-formatted array of Python 3.x minor version wheel targets'
+        required: false
+        type: string
+        # Do not build explicit python 3.12 packages. The 3.11 packages support >= 3.11.
+        # Python 3.12 and 3.13 aim to maintain ABI compatibility with Python 3.11 through the Stable ABI.
+        default: '["10","11"]'
+      manylinux-platforms:
+        description: 'JSON-formatted array of "<manylinux-image>-<arch>" specializations'
+        required: false
+        type: string
+        default: '["_2_28-x64"]'
+      macosx-deployment-target:
+        description: 'A string to provide as MACOSX_DEPLOYMENT_TARGET, e.g. "10.15". If left empty (default), v15.0 will be used.'
+        required: false
+        type: string
+        default: '15.0'
+      test-notebooks:
+        description: 'Option to test Jupyter Notebooks in examples/ directory with applied changes'
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      pypi_password:
+        required: false  # Packages will not be uploaded to PyPI if not set
+
+jobs:
+
+  build-linux-py:
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-22.04
+    strategy:
+      max-parallel: 2
+      matrix:
+        python3-minor-version: ${{ fromJSON(inputs.python3-minor-versions) }}
+        manylinux-platform: ${{ fromJSON(inputs.manylinux-platforms) }}
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Free Disk Space (Ubuntu)
+      uses: BRAINSia/free-disk-space@v2
+      with:
+        removalmode: "rmz"
+
+        swap-storage:   "true"
+        haskell:        "true"
+        dotnet:         "true"
+        docker-images:  "false" # Takes too long
+        tool-cache:     "true"
+        android:        "false" # Takes too long
+        large-packages: "false"  # Takes too long to remove apt-get packages
+        mandb:          "true"  # Speeds up future apt-get installs (disables man page generation), this CI does not use apt-get
+
+#    - name: 'Pre-pull dockcross image'
+#      run: |
+#        # Resolve the image tag dynamically from the ITKPythonPackage build scripts
+#        # so it matches exactly what the build step will pull.
+#        IPP_TAG=${{ inputs.itk-python-package-tag }}
+#        IPP_TAG=${IPP_TAG:=main}
+#        IPP_ORG=${{ inputs.itk-python-package-org }}
+#        IPP_ORG=${IPP_ORG:=InsightSoftwareConsortium}
+#
+#        MANYLINUX_PLATFORM=${{ matrix.manylinux-platform }}
+#        export MANYLINUX_VERSION=$(echo ${MANYLINUX_PLATFORM} | cut -d '-' -f 1)
+#        export TARGET_ARCH=$(echo ${MANYLINUX_PLATFORM} | cut -d '-' -f 2)
+#
+#        VARS_URL="https://raw.githubusercontent.com/${IPP_ORG}/ITKPythonPackage/${IPP_TAG}/scripts/dockcross-manylinux-set-vars.sh"
+#        echo "Fetching image tags from ${VARS_URL}"
+#        curl --retry 3 --retry-delay 30 --retry-all-errors -fsSL "${VARS_URL}" -o /tmp/set-vars.sh || { echo "Could not fetch set-vars.sh, skipping pre-pull"; exit 0; }
+#        source /tmp/set-vars.sh
+#
+#        if [[ -z ${CONTAINER_SOURCE} ]]; then
+#          echo "Could not determine container source, skipping pre-pull"
+#          exit 0
+#        fi
+#
+#        # Build the GHCR mirror name
+#        GHCR_IMAGE="ghcr.io/insightsoftwareconsortium/dockcross-manylinux${MANYLINUX_VERSION}-${TARGET_ARCH}:${IMAGE_TAG}"
+#        echo "Pre-pulling ${GHCR_IMAGE} (mirror of ${CONTAINER_SOURCE})"
+#        for attempt in 1 2 3; do
+#          if docker pull "${GHCR_IMAGE}" 2>/dev/null; then
+#            docker tag "${GHCR_IMAGE}" "${CONTAINER_SOURCE}"
+#            echo "Successfully pulled from GHCR mirror"
+#            exit 0
+#          fi
+#          echo "GHCR pull attempt ${attempt} failed, trying upstream ${CONTAINER_SOURCE}..."
+#          if docker pull "${CONTAINER_SOURCE}"; then
+#            echo "Successfully pulled from upstream"
+#            exit 0
+#          fi
+#          echo "Upstream pull attempt ${attempt} failed, retrying in 15s..."
+#          sleep 15
+#        done
+#        echo "WARNING: All pull attempts failed, build script will retry"
+
+    - name: 'Fetch Cached ITK Build'
+      run: |
+        IPP_DOWNLOAD_GIT_TAG=${{ inputs.itk-python-package-tag }}
+        IPP_DOWNLOAD_GIT_TAG=${IPP_DOWNLOAD_GIT_TAG:=main}
+        IPP_DOWNLOAD_ORG=${{ inputs.itk-python-package-org }}
+        IPP_DOWNLOAD_ORG=${IPP_DOWNLOAD_ORG:=InsightSoftwareConsortium}
+        curl --retry 3 --retry-delay 30 --retry-all-errors -L https://raw.githubusercontent.com/${IPP_DOWNLOAD_ORG}/ITKPythonPackage/${IPP_DOWNLOAD_GIT_TAG}/scripts/dockcross-manylinux-download-cache-and-build-module-wheels.sh -O
+        chmod u+x dockcross-manylinux-download-cache-and-build-module-wheels.sh
+
+    - name: Set up Python 3.11 for Validation
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+
+    - name: Install cibuildwheel
+      run: python -m pip install cibuildwheel==4.1.0
+
+    - name: 'Build 🐍 Python 📦 package'
+      shell: bash
+      run: |
+        rm -rf dist
+
+        export ITK_PACKAGE_VERSION=${{ inputs.itk-wheel-tag }}
+        export ITKPYTHONPACKAGE_TAG=${{ inputs.itk-python-package-tag }}
+        export ITKPYTHONPACKAGE_ORG=${{ inputs.itk-python-package-org }}
+        export ITK_MODULE_PREQ=${{ inputs.itk-module-deps }}
+        if [ -z ${{ inputs.cmake-options }} ]; then
+          CMAKE_OPTIONS=""
+        else
+          CMAKE_OPTIONS="--cmake_options ${{ inputs.cmake-options }}"
+        fi
+
+        MANYLINUX_PLATFORM=${{ matrix.manylinux-platform }}
+        echo "Manylinux platform ${MANYLINUX_PLATFORM}"
+        rm -rf ITKPythonPackage
+        export MANYLINUX_VERSION=`(echo ${MANYLINUX_PLATFORM} | cut -d '-' -f 1)`
+        export TARGET_ARCH=`(echo ${MANYLINUX_PLATFORM} | cut -d '-' -f 2)`
+        echo "Building for manylinux specialization ${MANYLINUX_VERSION} and target architecture ${TARGET_ARCH}"
+        echo "ITK_PACKAGE_VERSION=${ITK_PACKAGE_VERSION} ITKPYTHONPACKAGE_TAG=${ITKPYTHONPACKAGE_TAG} ITKPYTHONPACKAGE_ORG=${ITKPYTHONPACKAGE_ORG} ITK_MODULE_PREQ=${ITK_MODULE_PREQ} IPP_DOWNLOAD_GIT_TAG=${IPP_DOWNLOAD_GIT_TAG} IPP_DOWNLOAD_ORG=${IPP_DOWNLOAD_ORG} ./dockcross-manylinux-download-cache-and-build-module-wheels.sh cp3${{ matrix.python3-minor-version }} $CMAKE_OPTIONS"
+
+        ITK_PACKAGE_VERSION=${ITK_PACKAGE_VERSION} ITKPYTHONPACKAGE_TAG=${ITKPYTHONPACKAGE_TAG} ITKPYTHONPACKAGE_ORG=${ITKPYTHONPACKAGE_ORG} ITK_MODULE_PREQ=${ITK_MODULE_PREQ} IPP_DOWNLOAD_GIT_TAG=${IPP_DOWNLOAD_GIT_TAG} IPP_DOWNLOAD_ORG=${IPP_DOWNLOAD_ORG} ./dockcross-manylinux-download-cache-and-build-module-wheels.sh cp3${{ matrix.python3-minor-version }} $CMAKE_OPTIONS
+
+    - name: Validate build output
+      shell: bash
+      run: |
+        if [ -d dist ]; then
+          ls dist/
+        else
+          echo "Missing required directory 'dist' at $(pwd)"
+          exit 1
+        fi
+        echo "All wheels"
+        ls -al dist/*.whl
+        MANYLINUX_PLATFORM=${{ matrix.manylinux-platform }}
+        MANYLINUX_VERSION=`(echo ${MANYLINUX_PLATFORM} | cut -d '-' -f 1)`
+        TARGET_ARCH_NAME=`(echo ${MANYLINUX_PLATFORM} | cut -d '-' -f 2)`
+        if [[ ${TARGET_ARCH_NAME} == "x64" ]]; then
+          TARGET_ARCH_NAME="x86_64" # Match auditwheel naming convention
+        fi
+        WHEEL_PATTERN="dist/itk_*cp3${{ matrix.python3-minor-version }}*manylinux${MANYLINUX_VERSION}*${TARGET_ARCH_NAME}.whl"
+        echo "Searching for wheels matching pattern ${WHEEL_PATTERN}"
+        WHEEL_COUNT=`(ls ${WHEEL_PATTERN} 2>/dev/null | wc -l)`
+        if (( ${WHEEL_COUNT} == 0 )); then
+          echo "Wheel pattern not found"
+          exit 1
+        fi
+        python -m pip install twine
+        python -m twine check ${WHEEL_PATTERN}
+
+    - name: Publish Python package as GitHub Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: LinuxWheel3${{ matrix.python3-minor-version }}${{ matrix.manylinux-platform }}
+        path: dist/*.whl
+
+  build-linux-arm-py:
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-22.04-arm
+    strategy:
+      max-parallel: 2
+      matrix:
+        python3-minor-version: ${{ fromJSON(inputs.python3-minor-versions) }}
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Free Disk Space (Ubuntu)
+      uses: BRAINSia/free-disk-space@v2
+      with:
+        removalmode: "rmz"
+
+        swap-storage:   "true"
+        haskell:        "true"
+        dotnet:         "true"
+        docker-images:  "false" # Takes too long
+        tool-cache:     "true"
+        android:        "false" # Takes too long
+        large-packages: "false"  # Takes too long to remove apt-get packages
+        mandb:          "true"  # Speeds up future apt-get installs (disables man page generation), this CI does not use apt-get
+
+    - name: 'Pre-pull manylinux aarch64 image'
+      run: |
+        # Resolve the image tag dynamically from the ITKPythonPackage build scripts
+        IPP_TAG=${{ inputs.itk-python-package-tag }}
+        IPP_TAG=${IPP_TAG:=main}
+        IPP_ORG=${{ inputs.itk-python-package-org }}
+        IPP_ORG=${IPP_ORG:=InsightSoftwareConsortium}
+
+        export MANYLINUX_VERSION="_2_28"
+        export TARGET_ARCH="aarch64"
+
+        VARS_URL="https://raw.githubusercontent.com/${IPP_ORG}/ITKPythonPackage/${IPP_TAG}/scripts/dockcross-manylinux-set-vars.sh"
+        echo "Fetching image tags from ${VARS_URL}"
+        curl --retry 3 --retry-delay 30 --retry-all-errors -fsSL "${VARS_URL}" -o /tmp/set-vars.sh || { echo "Could not fetch set-vars.sh, skipping pre-pull"; exit 0; }
+        source /tmp/set-vars.sh
+
+        if [[ -z ${CONTAINER_SOURCE} ]]; then
+          echo "Could not determine container source, skipping pre-pull"
+          exit 0
+        fi
+
+        GHCR_IMAGE="ghcr.io/insightsoftwareconsortium/dockcross-manylinux_2_28-aarch64:${IMAGE_TAG}"
+        echo "Pre-pulling ${GHCR_IMAGE} (mirror of ${CONTAINER_SOURCE})"
+        for attempt in 1 2 3; do
+          if docker pull "${GHCR_IMAGE}" 2>/dev/null; then
+            docker tag "${GHCR_IMAGE}" "${CONTAINER_SOURCE}"
+            echo "Successfully pulled from GHCR mirror"
+            exit 0
+          fi
+          echo "GHCR pull attempt ${attempt} failed, trying upstream..."
+          if docker pull "${CONTAINER_SOURCE}"; then
+            echo "Successfully pulled from upstream"
+            exit 0
+          fi
+          echo "Upstream pull attempt ${attempt} failed, retrying in 15s..."
+          sleep 15
+        done
+        echo "WARNING: All pull attempts failed, build script will retry"
+
+    - name: 'Fetch build script'
+      run: |
+        IPP_DOWNLOAD_GIT_TAG=${{ inputs.itk-python-package-tag }}
+        IPP_DOWNLOAD_GIT_TAG=${IPP_DOWNLOAD_GIT_TAG:=main}
+        IPP_DOWNLOAD_ORG=${{ inputs.itk-python-package-org }}
+        IPP_DOWNLOAD_ORG=${IPP_DOWNLOAD_ORG:=InsightSoftwareConsortium}
+        curl --retry 3 --retry-delay 30 --retry-all-errors -L https://raw.githubusercontent.com/${IPP_DOWNLOAD_ORG}/ITKPythonPackage/${IPP_DOWNLOAD_GIT_TAG}/scripts/dockcross-manylinux-download-cache-and-build-module-wheels.sh -O
+        chmod u+x dockcross-manylinux-download-cache-and-build-module-wheels.sh
+
+    - name: 'Build 🐍 Python 📦 package'
+      shell: bash
+      run: |
+        rm -rf dist
+
+        export ITK_PACKAGE_VERSION=${{ inputs.itk-wheel-tag }}
+        export ITKPYTHONPACKAGE_TAG=${{ inputs.itk-python-package-tag }}
+        export ITKPYTHONPACKAGE_ORG=${{ inputs.itk-python-package-org }}
+        export ITK_MODULE_PREQ=${{ inputs.itk-module-deps }}
+        if [ -z ${{ inputs.cmake-options }} ]; then
+          CMAKE_OPTIONS=""
+        else
+          CMAKE_OPTIONS="--cmake_options ${{ inputs.cmake-options }}"
+        fi
+
+        MANYLINUX_PLATFORM="_2_28-aarch64"
+        echo "Manylinux platform ${MANYLINUX_PLATFORM}"
+        rm -rf ITKPythonPackage
+        export MANYLINUX_VERSION=`(echo ${MANYLINUX_PLATFORM} | cut -d '-' -f 1)`
+        export TARGET_ARCH=`(echo ${MANYLINUX_PLATFORM} | cut -d '-' -f 2)`
+        echo "Building for manylinux specialization ${MANYLINUX_VERSION} and target architecture ${TARGET_ARCH}"
+        echo "ITK_PACKAGE_VERSION=${ITK_PACKAGE_VERSION} ITKPYTHONPACKAGE_TAG=${ITKPYTHONPACKAGE_TAG} ITKPYTHONPACKAGE_ORG=${ITKPYTHONPACKAGE_ORG} ITK_MODULE_PREQ=${ITK_MODULE_PREQ} IPP_DOWNLOAD_GIT_TAG=${IPP_DOWNLOAD_GIT_TAG} IPP_DOWNLOAD_ORG=${IPP_DOWNLOAD_ORG} ./dockcross-manylinux-download-cache-and-build-module-wheels.sh cp3${{ matrix.python3-minor-version }} $CMAKE_OPTIONS"
+
+        ITK_PACKAGE_VERSION=${ITK_PACKAGE_VERSION} ITKPYTHONPACKAGE_TAG=${ITKPYTHONPACKAGE_TAG} ITKPYTHONPACKAGE_ORG=${ITKPYTHONPACKAGE_ORG} ITK_MODULE_PREQ=${ITK_MODULE_PREQ} IPP_DOWNLOAD_GIT_TAG=${IPP_DOWNLOAD_GIT_TAG} IPP_DOWNLOAD_ORG=${IPP_DOWNLOAD_ORG} ./dockcross-manylinux-download-cache-and-build-module-wheels.sh cp3${{ matrix.python3-minor-version }} $CMAKE_OPTIONS
+
+    - name: Set up Python 3.11 for Validation
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+
+    - name: Validate build output
+      shell: bash
+      run: |
+        if [ -d dist ]; then
+          ls dist/
+        else
+          echo "Missing required directory 'dist' at $(pwd)"
+          exit 1
+        fi
+        echo "All wheels"
+        ls -al dist/*.whl
+
+        MANYLINUX_PLATFORM="_2_28-aarch64"
+        MANYLINUX_VERSION=`(echo ${MANYLINUX_PLATFORM} | cut -d '-' -f 1)`
+        TARGET_ARCH_NAME=`(echo ${MANYLINUX_PLATFORM} | cut -d '-' -f 2)`
+        if [[ ${TARGET_ARCH_NAME} == "x64" ]]; then
+          TARGET_ARCH_NAME="x86_64" # Match auditwheel naming convention
+        fi
+        WHEEL_PATTERN="dist/itk_*cp3${{ matrix.python3-minor-version }}*manylinux${MANYLINUX_VERSION}*${TARGET_ARCH_NAME}.whl"
+
+        echo "Searching for wheels matching pattern ${WHEEL_PATTERN}"
+        python -m pip install twine
+        python -m twine check ${WHEEL_PATTERN}
+
+    - name: Publish Python package as GitHub Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: LinuxWheel3${{ matrix.python3-minor-version }}_2_28-aarch64
+        path: dist/*.whl
+
+  build-macos-arm-py:
+    runs-on: macos-14
+    strategy:
+      max-parallel: 2
+      matrix:
+        python3-minor-version: ${{ fromJSON(inputs.python3-minor-versions) }}
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        # workflow_dispatch self-test builds a real module; workflow_call
+        # callers are themselves the module repository (empty input -> caller repo)
+        repository: ${{ inputs.test-module-repository || github.repository }}
+
+    - name: 'Specific XCode version'
+      run: |
+        sudo xcode-select -s "/Applications/Xcode_16.2.app"
+
+    - name: 'Fetch and Configure Cached ITK Build'
+      run: |
+        # The cached ITK build trees have this absolute path baked into their
+        # CMake configuration, so they must be extracted exactly here.
+        DASHBOARD_BUILD_DIRECTORY=/Users/svc-dashboard/D/P
+        sudo mkdir -p ${DASHBOARD_BUILD_DIRECTORY}
+        sudo chown "$(id -u):$(id -g)" ${DASHBOARD_BUILD_DIRECTORY}
+
+        tarball_name="ITKPythonBuilds-macosx-$(arch).tar.zst"
+        curl --retry 3 --retry-delay 30 --retry-all-errors -fL -o "${tarball_name}" \
+          "https://github.com/InsightSoftwareConsortium/ITKPythonBuilds/releases/download/${{ inputs.itk-wheel-tag }}/${tarball_name}"
+
+        # Extract only the ITK source and the build tree for the target Python;
+        # cibuildwheel manages its own Python installs so the bundled venvs and
+        # build scripts are not needed.
+        zstd -d --long=31 -c "${tarball_name}" | tar -x -C "${DASHBOARD_BUILD_DIRECTORY}" \
+          'ITKPythonPackage/ITK-source' \
+          'ITKPythonPackage/ITK-3.${{ matrix.python3-minor-version }}-macosx*'
+        rm "${tarball_name}"
+
+        echo "ITK_DIR=${DASHBOARD_BUILD_DIRECTORY}/ITKPythonPackage/ITK-3.${{ matrix.python3-minor-version }}-macosx_arm64" >> "$GITHUB_ENV"
+
+    - name: 'Build 🐍 Python 📦 package'
+      uses: pypa/cibuildwheel@v4.1.0
+      with:
+        output-dir: dist
+      env:
+        CIBW_BUILD: "cp3${{ matrix.python3-minor-version }}-*"
+        CIBW_ARCHS_MACOS: arm64
+        # Python >= 3.11 wheels are tagged for the Stable ABI so one wheel
+        # covers 3.11+, matching ITKPythonPackage's macpython-build-module-wheels.sh
+        CIBW_CONFIG_SETTINGS_MACOS: ${{ matrix.python3-minor-version >= 11 && format('wheel.py-api=cp3{0}', matrix.python3-minor-version) || '' }}
+        CIBW_ENVIRONMENT_MACOS: >-
+          ITK_DIR=${{ env.ITK_DIR }}
+          MACOSX_DEPLOYMENT_TARGET=${{ inputs.macosx-deployment-target || '15.0' }}
+          CMAKE_ARGS="${{ inputs.cmake-options }}"
+
+    - name: Set up Python 3.11 for Validation
+      uses: actions/setup-python@v6
+      with:
+        python-version: "3.11"
+
+    - name: Validate build output
+      shell: bash
+      run: |
+        if [ -d dist ]; then
+          ls dist/
+        else
+          echo "Missing required directory 'dist' at $(pwd)"
+          exit 1
+        fi
+        echo "All wheels"
+        ls -al dist/*.whl
+
+        WHEEL_PATTERN="dist/itk_*macosx*.whl"
+        EXPECTED_WHEEL_COUNT=1
+
+        WHEEL_COUNT=`(ls ${WHEEL_PATTERN} | wc -l)`
+        if (( ${WHEEL_COUNT} != ${EXPECTED_WHEEL_COUNT} )); then
+          echo "Expected ${EXPECTED_WHEEL_COUNT} wheels but found ${WHEEL_COUNT}"
+          exit 1
+        fi
+
+        python -m pip install twine
+        python -m twine check ${WHEEL_PATTERN}
+
+    - name: Publish Python package as GitHub Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: MacOSArmWheel3${{ matrix.python3-minor-version }}
+        path: dist/*.whl
+
+  build-windows-python-packages:
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: windows-2022
+    strategy:
+      max-parallel: 2
+      matrix:
+        python3-minor-version: ${{ fromJSON(inputs.python3-minor-versions) }}
+
+    steps:
+    - name: Get specific version of CMake, Ninja
+      uses: lukka/get-cmake@v4.2.3
+
+    - uses: actions/checkout@v4
+      with:
+        path: "im"
+
+    - name: 'Reduce source path length'
+      shell: bash
+      run: |
+        # Move checked-out source to a shorter path to avoid Windows path length issues
+        mv im ../../
+
+    - name: 'Fetch build script'
+      shell: pwsh
+      run: |
+        cd ../../im
+        $ITKPYTHONPACKAGE_TAG = "${{ inputs.itk-python-package-tag }}"
+        $ITKPYTHONPACKAGE_ORG = "${{ inputs.itk-python-package-org }}"
+        $SCRIPT_UPSTREAM = "https://raw.githubusercontent.com/$ITKPYTHONPACKAGE_ORG/ITKPythonPackage/$ITKPYTHONPACKAGE_TAG/scripts/windows-download-cache-and-build-module-wheels.ps1"
+        echo "Fetching $SCRIPT_UPSTREAM"
+        (new-object net.webclient).DownloadString($SCRIPT_UPSTREAM) > windows-download-cache-and-build-module-wheels.ps1
+
+    - name: 'Build 🐍 Python 📦 package'
+      shell: pwsh
+      run: |
+        if (Test-Path dist) { rm dist -r -fo }
+
+        cd ../../im
+        & "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\Launch-VsDevShell.ps1" -Arch amd64 -SkipAutomaticLocation
+        $env:CC="cl.exe"
+        $env:CXX="cl.exe"
+        $env:ITK_PACKAGE_VERSION = "${{ inputs.itk-wheel-tag }}"
+        $env:ITKPYTHONPACKAGE_TAG = "${{ inputs.itk-python-package-tag }}"
+        $env:ITKPYTHONPACKAGE_ORG = "${{ inputs.itk-python-package-org }}"
+        $env:ITK_MODULE_PREQ = "${{ inputs.itk-module-deps }}"
+
+        # Put each (space separated) option in CMAKE_OPTIONS between quotes
+        $CMAKE_OPTIONS = "${{ inputs.cmake-options }}" -Replace ' ', '" "'
+        if("$cmake_options".length -gt 0) {
+          $CMAKE_OPTIONS = """${CMAKE_OPTIONS}"""
+        }
+        ./windows-download-cache-and-build-module-wheels.ps1 "${{ matrix.python3-minor-version }}" -cmake_options "${CMAKE_OPTIONS}"
+
+        mkdir -p '${{ github.workspace }}\dist'
+        cp 'dist\*.whl' '${{ github.workspace }}\dist'
+
+    - name: Set up Python 3.11 for Validation
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+
+    - name: Validate build output
+      shell: pwsh
+      run: |
+        ls dist/
+
+        $WHEEL_PATTERN = "dist/itk_*cp3${{ matrix.python3-minor-version }}*win*.whl"
+        echo "Searching for wheels matching pattern ${WHEEL_PATTERN}"
+
+        python -m pip install twine
+        python -m twine check ${WHEEL_PATTERN}
+
+    - name: Publish Python package as GitHub Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: WindowsWheel3${{ matrix.python3-minor-version }}
+        path: dist/*.whl
+
+  test-linux-notebooks:
+    if: inputs.test-notebooks
+    needs:
+      - build-linux-py
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.${{ fromJSON(inputs.python3-minor-versions)[0] }}"
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          if [[ -f ./examples/requirements.txt ]]; then
+            python -m pip install -r ./examples/requirements.txt
+          elif [[ -f requirements.txt ]]; then
+            python -m pip install -r requirements.txt
+          elif [[ -f ./binder/requirements.txt ]]; then
+            python -m pip install -r ./binder/requirements.txt
+          fi
+          python -m pip install pytest nbmake
+
+      - name: Download Python Package Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: LinuxWheel3${{ fromJSON(inputs.python3-minor-versions)[0] }}_2_28-x64
+
+      - name: Install Python Package Artifact
+        run: |
+          ls .
+          wheel_name_full=`(find . -name "*cp3${{ fromJSON(inputs.python3-minor-versions)[0] }}*manylinux_2_28_x86_64.whl")`
+          echo "wheel_name_full ${wheel_name_full}"
+          # extract wheel name which may be an abbreviation of the module name
+          # ex. ./itk_splitcomponents-cp310..._64.whl -> itk-splitcomponents
+          wheel_name_prefix=`(echo ${wheel_name_full} | cut -d'-' -f1 | cut -d'/' -f2 | sed -e 's/_/-/g')`
+          echo "wheel_name_prefix ${wheel_name_prefix}"
+          python -m pip uninstall ${wheel_name_prefix} -y
+          python -m pip install ${wheel_name_full}
+
+      - name: Test notebooks
+        run: |
+          pytest --nbmake --nbmake-timeout=30000 examples/*.ipynb
+
+  publish-python-packages-to-pypi:
+    needs:
+      - build-linux-py
+      - build-linux-arm-py
+      - build-macos-arm-py
+      - build-windows-python-packages
+    runs-on: ubuntu-22.04
+
+    steps:
+    - name: Download Python Packages
+      uses: actions/download-artifact@v4
+
+    - name: Prepare packages for upload
+      run: |
+        ls -R
+        for d in */; do
+          mv ${d}/*.whl .
+        done
+        mkdir dist
+        mv *.whl dist/
+        ls dist
+
+    - name: Publish 🐍 Python 📦 package to PyPI
+      if: github.event_name == 'push' && startsWith(github.event.ref, 'refs/tags')
+      uses: pypa/gh-action-pypi-publish@v1.5.1
+      with:
+        skip_existing: true
+        user: __token__
+        password: ${{ secrets.pypi_password }}
