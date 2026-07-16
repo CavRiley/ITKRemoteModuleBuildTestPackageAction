@@ -410,11 +410,14 @@ jobs:
         # PY_SITE_PACKAGES_PATH=. installs the wrapped package at the wheel root
         # (without it the compiled modules never land in the wheel), and py>=3.11
         # wheels are tagged for the Stable ABI so one wheel covers 3.11+.
+        # The :PATH type on PY_SITE_PACKAGES_PATH is load-bearing: untyped, CMake
+        # absolutizes the "." against the source dir when WrapITK re-declares it
+        # CACHE PATH, and the wrapped modules then install outside the wheel.
         CIBW_CONFIG_SETTINGS_MACOS: >-
-          cmake.define.WRAP_ITK_INSTALL_COMPONENT_IDENTIFIER=PythonWheel
-          cmake.define.PY_SITE_PACKAGES_PATH=.
-          cmake.define.CMAKE_INSTALL_LIBDIR=lib
-          cmake.define.BUILD_TESTING=OFF
+          cmake.define.WRAP_ITK_INSTALL_COMPONENT_IDENTIFIER:STRING=PythonWheel
+          cmake.define.PY_SITE_PACKAGES_PATH:PATH=.
+          cmake.define.CMAKE_INSTALL_LIBDIR:STRING=lib
+          cmake.define.BUILD_TESTING:BOOL=OFF
           ${{ matrix.python3-minor-version >= 11 && format('wheel.py-api=cp3{0}', matrix.python3-minor-version) || '' }}
         CIBW_ENVIRONMENT_MACOS: >-
           ITK_DIR=${{ env.ITK_DIR }}
